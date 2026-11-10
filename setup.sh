@@ -272,7 +272,8 @@ if command -v systemctl >/dev/null 2>&1 && [ -f "$BASE/report.py" ] \
     sudo systemctl daemon-reload
     sudo systemctl enable --now a1grab-report.timer >/dev/null 2>&1
     if systemctl is-active --quiet a1grab-report.timer; then
-      ok "日报定时器已启用：每天 00:05 生成昨天的日报"
+      ok "日报定时器已启用：每天 08:00 生成昨天的日报"
+      echo "    配了 pushplus_token 的话，同一时刻还会推一条微信摘要"
       echo "    立刻生成一份试试： python3 $BASE/report.py --days 2"
       echo "    输出目录：         $BASE/reports/"
     else

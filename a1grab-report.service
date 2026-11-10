@@ -9,8 +9,10 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/a1grab
 # 生成「昨天」的完整日报（今天的半日数据由拉取脚本按需刷新）。
+# --notify：顺手把当天摘要推到微信；推送失败只记日志，不影响报表生成。
+# 不想每天收消息就删掉 --notify。
 # 注意：unit 文件里的 % 必须写成 %%，所以 date 格式串是 +%%F。
-ExecStart=/bin/sh -c '/usr/bin/python3 /home/opc/a1grab/report.py --date $(date -d yesterday +%%F)'
+ExecStart=/bin/sh -c '/usr/bin/python3 /home/opc/a1grab/report.py --date $(date -d yesterday +%%F) --notify'
 Nice=15
 IOSchedulingClass=best-effort
 # 报表器极轻：实测单份 0.39s / 内存 <25MB，给足余量即可

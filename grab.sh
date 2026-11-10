@@ -51,8 +51,11 @@ fi
 : "${MODEL:=VM.Standard.A1.Flex}"
 : "${OCPUS:=1}"
 : "${MEMGB:=6}"
-: "${INTERVAL:=600}"     # 每轮间隔基准（秒）。默认 10 分钟，见 README「调频与风控」
-: "${JITTER:=60}"        # 随机抖动上限（秒），避免固定节奏
+: "${INTERVAL:=540}"     # 常规间隔均值（秒），实际取 INTERVAL±JITTER
+: "${JITTER:=60}"        # 抖动幅度（秒）：常规区间 480~600 秒
+: "${REST_PCT:=5}"       # 长休概率（%）：模拟"人不会一直守在电脑前"
+: "${REST_MIN:=900}"     # 长休最短（秒）= 15 分钟
+: "${REST_MAX:=2700}"    # 长休最长（秒）= 45 分钟
 : "${NAME:=a1-free}"     # 实例显示名
 : "${IMAGE:=auto}"       # auto = 自动挑该区域最新的 ARM 镜像
 : "${IMAGE_OS:=Oracle Linux}"
@@ -192,7 +195,7 @@ if [ "${avail:-0}" -lt 110 ]; then
   exit 0
 fi
 
-log "===== 抢机启动：$MODEL ${OCPUS}OCPU/${MEMGB}GB，间隔 ${INTERVAL}s(+0~${JITTER}s)，可用域 ${#ADS[@]} 个 ====="
+log "===== 抢机启动：$MODEL ${OCPUS}OCPU/${MEMGB}GB，间隔 ${INTERVAL}s±${JITTER}s，${REST_PCT}% 概率长休 ${REST_MIN}~${REST_MAX}s，可用域 ${#ADS[@]} 个 ====="
 
 round=0
 last_msg=""
@@ -296,7 +299,19 @@ while :; do
     fi
   done
 
-  log "第 $round 轮 →$summary"
+  # 休眠时长 = INTERVAL±JITTER 的均匀随机，另有 REST_PCT% 概率叠加一次长休。
+  # 为什么要有长休：均匀抖动会被一天上百轮的累加平均掉，日总量永远卡在同一个
+  # 数字上（实测连续 11 天都是 402~405 次）；只有低频、大幅度的抖动才能真正
+  # 拉开日间差异，也更像「人在盯，但要吃饭睡觉」。
+  nap=$((INTERVAL - JITTER + RANDOM % (JITTER * 2 + 1) + extra))
+  rest_tag=""
+  if [ "$extra" -eq 0 ] && [ "${REST_PCT:-0}" -gt 0 ] \
+     && [ $((RANDOM % 100)) -lt "${REST_PCT}" ]; then
+    nap=$((nap + REST_MIN + RANDOM % (REST_MAX - REST_MIN + 1)))
+    rest_tag="（含长休）"
+  fi
+  [ "$nap" -lt 60 ] && nap=60
+  log "第 $round 轮 →$summary ｜ 耗时 $(( $(date +%s) - t_round ))s，休眠 ${nap}s${rest_tag}"
 
-  sleep $((INTERVAL + RANDOM % (JITTER + 1) + extra))
+  sleep "$nap"
 done

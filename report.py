@@ -11,24 +11,69 @@
   ./report.py --days 14      # 回填最近 14 天
   ./report.py --all          # 全部历史
   ./report.py --index-only   # 只刷新目录页
+  ./report.py --notify       # 生成后把摘要推到微信（PushPlus）
+
+节奏参数（INTERVAL/JITTER/REST_*）从同目录 config.sh 读取，
+所以调整抢机节奏后报表的健康检查会自动跟着变，无需改本文件。
 """
 
 import argparse
+import json
 import os
 import re
 import sys
+import urllib.request
 from datetime import datetime, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(BASE, "grab.log")
 OUTDIR = os.path.join(BASE, "reports")
+CFGFILE = os.path.join(BASE, "config.sh")
 
-DESIGN_MIN, DESIGN_MAX = 600, 660   # 设计间隔 600s + 0~60s 抖动
-LONG_GAP = 800                      # 超过此值视为异常长间隔
+
+def load_rhythm():
+    """从同目录 config.sh 读节奏参数。
+
+    报表必须跟着配置走，不能把 600~660 这种数字写死在代码里——
+    一旦调了 INTERVAL/JITTER，硬编码的「健康检查」就会把所有日子判成异常。
+    读不到就退回旧默认值（600 ± 60，无长休）。
+    """
+    cfg = {"INTERVAL": 600, "JITTER": 60, "REST_PCT": 0,
+           "REST_MIN": 0, "REST_MAX": 0}
+    try:
+        with open(CFGFILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                m = re.match(r"^([A-Z_]+)=(.*)$", line)
+                if not m or m.group(1) not in cfg:
+                    continue
+                v = m.group(2).strip().strip('"').strip("'")
+                try:
+                    cfg[m.group(1)] = int(v)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return cfg
+
+
+RHYTHM = load_rhythm()
+GAP_MIN = max(60, RHYTHM["INTERVAL"] - RHYTHM["JITTER"])   # 常规最短
+GAP_MAX = RHYTHM["INTERVAL"] + RHYTHM["JITTER"]            # 常规最长
+REST_CEIL = GAP_MAX + RHYTHM["REST_MAX"]                   # 长休上限
+SLACK = 40                            # 调度误差容忍（秒）
+LONG_GAP = GAP_MAX + SLACK            # 超过即不属于常规节奏
+
+# 判定「这一轮是脚本主动长休」的休眠秒数下限。
+# 取 REST_MIN 的一半做容差，避免把旧配置（600~660 秒）下的正常间隔
+# 拿新阈值去量、批量误判成长休——历史日志不能按当前配置判。
+REST_FLOOR = (GAP_MAX + max(120, RHYTHM["REST_MIN"] // 2)
+              if RHYTHM["REST_PCT"] else None)
 
 RE_ROUND = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})\] 第 (\d+) 轮 → (.+?)"
-    r"(?: ｜ 耗时 (\d+)s，休眠 (\d+)s)?$")
+    # 结尾可能带「（含长休）」后缀，必须吃掉，否则整条 nap 都解析不出来
+    r"(?: ｜ 耗时 (\d+)s，休眠 (\d+)s(?:（含长休）)?)?$")
 RE_AD = re.compile(r"PHX-AD-(\d+)=(\S+)")
 RE_RL = re.compile(r"^\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})\] ⚠️ 触发限流")
 RE_ERR = re.compile(
@@ -119,6 +164,7 @@ def aggregate(day):
         "ads": {},
         "intervals": [],
         "long_gaps": [],
+        "rests": [],
         "cost": [],
         "nap": [],
         "hourly": [0] * 24,
@@ -150,10 +196,29 @@ def aggregate(day):
         if r["nap"]:
             st["nap"].append(r["nap"])
 
+    # 判定阈值按当天自己的数据分布来定，不写死：
+    # 历史日志（旧配置 600~660）和今天的新配置（480~600 + 长休）混在一份日志里，
+    # 用固定的绝对阈值必然误判其中一边。
+    if st["intervals"]:
+        srt = sorted(st["intervals"])
+        median_gap = srt[len(srt) // 2]
+    else:
+        median_gap = GAP_MAX
+    lo_thresh = max(LONG_GAP, median_gap * 1.5)
+    st["gap_threshold"] = lo_thresh
+
     for a, b in zip(rounds, rounds[1:]):
         gap = (b["t"] - a["t"]).total_seconds()
         st["intervals"].append(gap)
-        if gap > LONG_GAP:
+        if gap <= lo_thresh:
+            continue
+        # 超过常规上限了，还要分清「脚本主动长休」和「真卡住了」。
+        # 只认该轮日志里明写的 nap：早期版本没记 nap，用间隔反推会把卡顿
+        # 算成长休（2026-09-22 实测就多算出 2 次），宁可存疑也不假阴性。
+        nap = a["nap"]
+        if nap and REST_FLOOR and REST_FLOOR <= nap <= REST_CEIL:
+            st["rests"].append((a["t"], b["t"], gap))
+        else:
             st["long_gaps"].append((a["t"], b["t"], gap))
 
     return st
@@ -308,7 +373,7 @@ def render_day(ds, day, st, cfg_hint):
         ("请求异常", str(err), "次", "c-red" if err else "c-gray",
          "非容量类报错"),
         ("平均间隔", "%.0f 秒" % avg_gap, "≈ %.1f 分钟" % (avg_gap / 60), "c-gray",
-         "设计 %d~%d 秒" % (DESIGN_MIN, DESIGN_MAX)),
+         "常规 %d~%d 秒" % (GAP_MIN, GAP_MAX)),
     ]
     for label, val, unit, cls, sub in items:
         kpi.append('<div class="kpi"><div class="n %s">%s</div>'
@@ -346,23 +411,35 @@ def render_day(ds, day, st, cfg_hint):
                        % (cls, esc(label), cnt, pct))
 
     # 健康检查
+    exp_rest = ((RHYTHM["REST_MIN"] + RHYTHM["REST_MAX"]) / 2.0
+                if RHYTHM["REST_PCT"] else 0)
+    exp_gap = RHYTHM["INTERVAL"] + RHYTHM["REST_PCT"] / 100.0 * exp_rest
     notes = []
-    if avg_gap and DESIGN_MIN - 5 <= avg_gap <= DESIGN_MAX + 10:
-        notes.append('<li>轮询节奏正常：平均间隔 %.0f 秒，落在设计区间 %d~%d 秒内 '
-                     '<span class="ok">✓</span></li>' % (avg_gap, DESIGN_MIN, DESIGN_MAX))
+    if avg_gap and abs(avg_gap - exp_gap) <= max(60, exp_gap * 0.12):
+        notes.append('<li>轮询节奏正常：平均间隔 %.0f 秒，与设计均值 %.0f 秒相符 '
+                     '<span class="ok">✓</span></li>' % (avg_gap, exp_gap))
     elif avg_gap:
-        notes.append('<li>轮询节奏偏离设计值：平均 %.0f 秒，设计 %d~%d 秒 '
-                     '<span class="warn">需关注</span></li>'
-                     % (avg_gap, DESIGN_MIN, DESIGN_MAX))
+        notes.append('<li>轮询节奏偏离设计值：平均 %.0f 秒，设计均值 %.0f 秒 '
+                     '<span class="warn">需关注</span></li>' % (avg_gap, exp_gap))
+
+    # 只在真的发生长休时才写这一行：历史日报跑的是旧配置（没有长休机制），
+    # 在那几天硬写「今日未触发长休」属于编造。
+    if st["rests"]:
+        rest_total = sum(g[2] for g in st["rests"])
+        notes.append('<li>主动长休 %d 次，合计 %.1f 分钟（设计为 %d%% 概率、'
+                     '每次 %d~%d 秒，用于打破过于机械的节奏）</li>'
+                     % (len(st["rests"]), rest_total / 60, RHYTHM["REST_PCT"],
+                        RHYTHM["REST_MIN"], RHYTHM["REST_MAX"]))
 
     if st["long_gaps"]:
         worst = max(st["long_gaps"], key=lambda g: g[2])
         notes.append('<li>出现 %d 次超长间隔（&gt;%d 秒），最长一次 %.1f 分钟'
                      '（%s，白等合计 %.1f 分钟）<span class="warn">需关注</span></li>'
-                     % (len(st["long_gaps"]), LONG_GAP, worst[2] / 60,
+                     % (len(st["long_gaps"]), st.get("gap_threshold", LONG_GAP),
+                        worst[2] / 60,
                         worst[0].strftime("%H:%M"), long_waste / 60))
     else:
-        notes.append('<li>无超长间隔，全天节奏平稳 <span class="ok">✓</span></li>')
+        notes.append('<li>除计划内长休外，无异常间隔 <span class="ok">✓</span></li>')
 
     if rl == 0:
         notes.append('<li>全天零限流，请求频率安全 <span class="ok">✓</span></li>')
@@ -428,8 +505,9 @@ def render_day(ds, day, st, cfg_hint):
                  '<th>各可用域结果</th><th class="num">耗时</th>'
                  '<th class="num">休眠</th></tr></thead><tbody>%s</tbody></table>'
                  '<p style="font-size:12px;color:#9ca3af;margin-top:10px">'
-                 '「休眠」是本轮结束后实际等待的秒数，正常应在 %d~%d 秒之间。</p>'
-                 '</div>' % ("".join(rec_rows), DESIGN_MIN, DESIGN_MAX + 20))
+                 '「休眠」是本轮结束后实际等待的秒数：常规 %d~%d 秒，'
+                 '触发长休时会明显变长（最多到 %d 秒）。</p>'
+                 '</div>' % ("".join(rec_rows), GAP_MIN, GAP_MAX, REST_CEIL))
 
     return _page(ds, weekday, generated, "".join(parts), verdict), st
 
@@ -518,6 +596,81 @@ def render_index(entries):
 """ % (CSS, generated, body)
 
 
+# ---------------------------------------------------------------- 微信推送
+
+def push_pushplus(title, html):
+    """用 PushPlus 把日报摘要推到微信。凭据读同目录 pushplus_token。
+
+    返回 (成功与否, 说明)。任何失败都只记日志、不抛异常——
+    推不出去不能连累报表生成。
+    """
+    tokfile = os.path.join(BASE, "pushplus_token")
+    try:
+        with open(tokfile, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+    except OSError:
+        return False, "未找到 %s，跳过推送" % tokfile
+    if not tok:
+        return False, "pushplus_token 为空，跳过推送"
+
+    payload = json.dumps({"token": tok, "title": title,
+                          "content": html, "template": "html"}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.pushplus.plus/send", data=payload,
+        headers={"Content-Type": "application/json"})
+    # 显式禁用代理：这台机器上也没配代理，但避免继承到奇怪的 http_proxy
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=25) as r:
+            body = r.read().decode("utf-8", "replace")
+    except Exception as exc:
+        return False, "请求失败：%s" % exc
+    try:
+        j = json.loads(body)
+    except ValueError:
+        return False, "响应非 JSON：%s" % body[:120]
+    if j.get("code") == 200:
+        return True, "code=200"
+    return False, "code=%s msg=%s" % (j.get("code"), j.get("msg"))
+
+
+def build_digest(ds, st):
+    """把单日统计压成一条适合微信看的短摘要（HTML）"""
+    ok = st["success"]
+    rl = st["status"].get("触发限流", 0)
+    err = st["status"].get("请求异常", 0)
+    cap = st["status"].get("容量不足", 0)
+    gaps = st["intervals"]
+    avg = sum(gaps) / len(gaps) if gaps else 0
+    rests = st["rests"]
+
+    if ok:
+        head = "<b>🎉 抢到了 %d 次</b>" % ok
+    elif st["rounds"] == 0:
+        head = "<b>⚠️ 当天没有轮询记录</b>"
+    else:
+        head = "<b>仍未抢到</b>"
+
+    ad_rows = "".join(
+        "<tr><td>%s</td><td align=right>%d</td></tr>"
+        % (k, v["total"]) for k, v in sorted(st["ads"].items()))
+
+    body = (
+        "%s<br>"
+        "%s 共 %d 轮 / %d 次请求<br>"
+        "无容量 %d · 限流 %d · 异常 %d<br>"
+        "平均间隔 %.0f 秒（常规 %d~%d 秒），长休 %d 次<br>"
+        "<table cellpadding=2 cellspacing=0>%s</table>"
+        % (head, ds, st["rounds"], st["attempts"], cap, rl, err,
+           avg, GAP_MIN, GAP_MAX, len(rests), ad_rows))
+
+    if rl:
+        body += "<br><span style='color:#c2410c'>出现限流，建议调大 INTERVAL</span>"
+    if err:
+        body += "<br><span style='color:#b91c1c'>有 %d 次非容量异常，详见日报</span>" % err
+    return body
+
+
 # ---------------------------------------------------------------- 主流程
 
 def build_one(ds, day, cfg_hint):
@@ -549,6 +702,8 @@ def main():
     ap.add_argument("--days", type=int, help="回填最近 N 天")
     ap.add_argument("--all", action="store_true", help="回填全部历史")
     ap.add_argument("--index-only", action="store_true", help="只刷新目录页")
+    ap.add_argument("--notify", action="store_true",
+                    help="生成后把首份日报摘要推到微信（读同目录 pushplus_token）")
     ap.add_argument("--log", default=LOG, help="日志路径")
     args = ap.parse_args()
 
@@ -580,6 +735,15 @@ def main():
         print("%s  %3d 轮 / %4d 次 / 抢到 %d / 限流 %d  → %s"
               % (ds, st["rounds"], st["attempts"], st.get("success", 0),
                  st["status"].get("触发限流", 0), path))
+
+    # 推送放在重建目录页之前：目录页写坏了也不该影响"今天有没有消息"
+    if args.notify and written:
+        ds, st, _ = written[0]
+        title = "OCI A1 日报 %s" % ds[5:]
+        if st["success"]:
+            title += " · 抢到了"
+        ok, info = push_pushplus(title, build_digest(ds, st))
+        print("推送 %s：%s（%s）" % ("成功" if ok else "失败", title, info))
 
     # 重建目录页（扫描现有报告文件）
     entries = []
