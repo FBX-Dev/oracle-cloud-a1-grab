@@ -1,0 +1,13 @@
+[Unit]
+Description=Generate OCI A1 grab report daily at 00:05
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+# 机器关机/休眠错过时间点，开机后补跑一次
+Persistent=true
+# 加一点随机偏移，避免整点与其它任务撞车
+RandomizedDelaySec=120
+Unit=a1grab-report.service
+
+[Install]
+WantedBy=timers.target

@@ -252,6 +252,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6. 安装每日日报定时器（可选，但很实用）
+# ---------------------------------------------------------------------------
+if command -v systemctl >/dev/null 2>&1 && [ -f "$BASE/report.py" ] \
+   && [ -f "$BASE/a1grab-report.service" ] && [ -f "$BASE/a1grab-report.timer" ]; then
+  say "安装每日日报定时器"
+  CUR_USER="$(id -un)"
+  TMP_SVC="$(mktemp)"
+  sed "s|^User=.*|User=$CUR_USER|" "$BASE/a1grab-report.service" >"$TMP_SVC"
+
+  if sudo cp "$TMP_SVC" /etc/systemd/system/a1grab-report.service 2>/dev/null \
+     && sudo cp "$BASE/a1grab-report.timer" /etc/systemd/system/a1grab-report.timer 2>/dev/null; then
+    rm -f "$TMP_SVC"
+    # unit 里的路径是 /home/opc/a1grab，换成实际目录
+    if [ "$BASE" != "/home/opc/a1grab" ]; then
+      sudo sed -i "s|/home/opc/a1grab|$BASE|g; s|^User=.*|User=$CUR_USER|" \
+        /etc/systemd/system/a1grab-report.service
+    fi
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now a1grab-report.timer >/dev/null 2>&1
+    if systemctl is-active --quiet a1grab-report.timer; then
+      ok "日报定时器已启用：每天 00:05 生成昨天的日报"
+      echo "    立刻生成一份试试： python3 $BASE/report.py --days 2"
+      echo "    输出目录：         $BASE/reports/"
+    else
+      warn "定时器未能启用，手动试：sudo systemctl enable --now a1grab-report.timer"
+    fi
+  else
+    rm -f "$TMP_SVC"
+    warn "写入日报 unit 失败，跳过（不影响抢机）"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 完成
 # ---------------------------------------------------------------------------
 say "部署完成"
@@ -259,6 +292,7 @@ cat <<EOF
   查看进展：   tail -f $BASE/grab.log
   一键状态：   $BASE/status.sh
   手动跑一轮： $BASE/grab.sh
+  生成日报：   python3 $BASE/report.py --days 2   → $BASE/reports/index.html
 
   【下一步：配置抢到后的通知（可选）】
     PushPlus（推到微信，推荐）：

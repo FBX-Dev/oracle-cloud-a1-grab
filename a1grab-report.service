@@ -1,0 +1,20 @@
+[Unit]
+Description=OCI A1 grab daily HTML report
+Documentation=file:///home/opc/a1grab/README.txt
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/a1grab
+# 生成「昨天」的完整日报（今天的半日数据由拉取脚本按需刷新）。
+# 注意：unit 文件里的 % 必须写成 %%，所以 date 格式串是 +%%F。
+ExecStart=/bin/sh -c '/usr/bin/python3 /home/opc/a1grab/report.py --date $(date -d yesterday +%%F)'
+Nice=15
+IOSchedulingClass=best-effort
+# 报表器极轻：实测单份 0.39s / 内存 <25MB，给足余量即可
+MemoryMax=150M
+CPUQuota=30%
+StandardOutput=append:/home/opc/a1grab/report.log
+StandardError=append:/home/opc/a1grab/report.log
